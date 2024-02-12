@@ -9,12 +9,13 @@ use std::num::NonZeroUsize;
 
 use either::{Left, Right};
 
+use hir::def::DefKind;
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_middle::mir::interpret::{
-    ExpectedKind, InterpError, InvalidMetaKind, Misalignment, PointerKind, ValidationErrorInfo,
-    ValidationErrorKind, ValidationErrorKind::*,
+    ExpectedKind, InterpError, InvalidMetaKind, Misalignment, PointerKind, Provenance,
+    ValidationErrorInfo, ValidationErrorKind, ValidationErrorKind::*,
 };
 use rustc_middle::ty;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
@@ -26,8 +27,9 @@ use rustc_target::abi::{
 use std::hash::Hash;
 
 use super::{
-    AllocId, CheckInAllocMsg, GlobalAlloc, ImmTy, Immediate, InterpCx, InterpResult, MPlaceTy,
-    Machine, MemPlaceMeta, OpTy, Pointer, Projectable, Scalar, ValueVisitor,
+    format_interp_error, AllocId, CheckInAllocMsg, GlobalAlloc, ImmTy, Immediate, InterpCx,
+    InterpResult, MPlaceTy, Machine, MemPlaceMeta, OpTy, Pointer, Projectable, Scalar,
+    ValueVisitor,
 };
 
 // for the validation errors
@@ -123,15 +125,33 @@ pub enum PathElem {
 }
 
 /// Extra things to check for during validation of CTFE results.
+#[derive(Copy, Clone)]
 pub enum CtfeValidationMode {
-    /// Regular validation, nothing special happening.
-    Regular,
-    /// Validation of a `const`.
-    /// `inner` says if this is an inner, indirect allocation (as opposed to the top-level const
-    /// allocation). Being an inner allocation makes a difference because the top-level allocation
-    /// of a `const` is copied for each use, but the inner allocations are implicitly shared.
-    /// `allow_static_ptrs` says if pointers to statics are permitted (which is the case for promoteds in statics).
-    Const { inner: bool, allow_static_ptrs: bool },
+    /// Validation of a `static`
+    Static { mutbl: Mutability },
+    /// Validation of a `const` (including promoteds).
+    /// `allow_immutable_unsafe_cell` says whether we allow `UnsafeCell` in immutable memory (which is the
+    /// case for the top-level allocation of a `const`, where this is fine because the allocation will be
+    /// copied at each use site).
+    Const { allow_immutable_unsafe_cell: bool, allow_extern_static_ptrs: bool },
+}
+
+impl CtfeValidationMode {
+    fn allow_immutable_unsafe_cell(self) -> bool {
+        match self {
+            CtfeValidationMode::Static { .. } => false,
+            CtfeValidationMode::Const { allow_immutable_unsafe_cell, .. } => {
+                allow_immutable_unsafe_cell
+            }
+        }
+    }
+
+    fn may_contain_mutable_ref(self) -> bool {
+        match self {
+            CtfeValidationMode::Static { mutbl } => mutbl == Mutability::Mut,
+            CtfeValidationMode::Const { .. } => false,
+        }
+    }
 }
 
 /// State for tracking recursive validation of references
@@ -418,50 +438,95 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
         }
         // Recursive checking
         if let Some(ref_tracking) = self.ref_tracking.as_deref_mut() {
+            // Determine whether this pointer expects to be pointing to something mutable.
+            let ptr_expected_mutbl = match ptr_kind {
+                PointerKind::Box => Mutability::Mut,
+                PointerKind::Ref => {
+                    let tam = value.layout.ty.builtin_deref(false).unwrap();
+                    // ZST never require mutability. We do not take into account interior mutability
+                    // here since we cannot know if there really is an `UnsafeCell` inside
+                    // `Option<UnsafeCell>` -- so we check that in the recursive descent behind this
+                    // reference.
+                    if size == Size::ZERO { Mutability::Not } else { tam.mutbl }
+                }
+            };
             // Proceed recursively even for ZST, no reason to skip them!
             // `!` is a ZST and we want to validate it.
             if let Ok((alloc_id, _offset, _prov)) = self.ecx.ptr_try_get_alloc_id(place.ptr()) {
                 // Let's see what kind of memory this points to.
-                let alloc_kind = self.ecx.tcx.try_get_global_alloc(alloc_id);
+                // `unwrap` since dangling pointers have already been handled.
+                let alloc_kind = self.ecx.tcx.try_get_global_alloc(alloc_id).unwrap();
                 match alloc_kind {
-                    Some(GlobalAlloc::Static(did)) => {
+                    GlobalAlloc::Static(did) => {
                         // Special handling for pointers to statics (irrespective of their type).
                         assert!(!self.ecx.tcx.is_thread_local_static(did));
                         assert!(self.ecx.tcx.is_static(did));
-                        if matches!(
-                            self.ctfe_mode,
-                            Some(CtfeValidationMode::Const { allow_static_ptrs: false, .. })
-                        ) {
-                            // See const_eval::machine::MemoryExtra::can_access_statics for why
-                            // this check is so important.
-                            // This check is reachable when the const just referenced the static,
-                            // but never read it (so we never entered `before_access_global`).
-                            throw_validation_failure!(self.path, PtrToStatic { ptr_kind });
+                        let is_mut =
+                            matches!(self.ecx.tcx.def_kind(did), DefKind::Static(Mutability::Mut))
+                                || !self
+                                    .ecx
+                                    .tcx
+                                    .type_of(did)
+                                    .no_bound_vars()
+                                    .expect("statics should not have generic parameters")
+                                    .is_freeze(*self.ecx.tcx, ty::ParamEnv::reveal_all());
+                        // Mutability check.
+                        if ptr_expected_mutbl == Mutability::Mut {
+                            if !is_mut {
+                                throw_validation_failure!(self.path, MutableRefToImmutable);
+                            }
                         }
-                        // We skip recursively checking other statics. These statics must be sound by
-                        // themselves, and the only way to get broken statics here is by using
-                        // unsafe code.
-                        // The reasons we don't check other statics is twofold. For one, in all
-                        // sound cases, the static was already validated on its own, and second, we
-                        // trigger cycle errors if we try to compute the value of the other static
-                        // and that static refers back to us.
-                        // We might miss const-invalid data,
-                        // but things are still sound otherwise (in particular re: consts
-                        // referring to statics).
-                        return Ok(());
+                        match self.ctfe_mode {
+                            Some(CtfeValidationMode::Static { .. }) => {
+                                // We skip recursively checking other statics. These statics must be sound by
+                                // themselves, and the only way to get broken statics here is by using
+                                // unsafe code.
+                                // The reasons we don't check other statics is twofold. For one, in all
+                                // sound cases, the static was already validated on its own, and second, we
+                                // trigger cycle errors if we try to compute the value of the other static
+                                // and that static refers back to us.
+                                // This could miss some UB, but that's fine.
+                                return Ok(());
+                            }
+                            Some(CtfeValidationMode::Const {
+                                allow_extern_static_ptrs, ..
+                            }) => {
+                                // For consts on the other hand we have to recursively check;
+                                // pattern matching assumes a valid value. However we better make
+                                // sure this is not mutable.
+                                if is_mut {
+                                    throw_validation_failure!(self.path, ConstRefToMutable);
+                                }
+                                if self.ecx.tcx.is_foreign_item(did) {
+                                    if !allow_extern_static_ptrs {
+                                        throw_validation_failure!(self.path, ConstRefToExtern);
+                                    } else {
+                                        // We can't validate this...
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
                     }
-                    Some(GlobalAlloc::Memory(alloc)) => {
+                    GlobalAlloc::Memory(alloc) => {
                         if alloc.inner().mutability == Mutability::Mut
                             && matches!(self.ctfe_mode, Some(CtfeValidationMode::Const { .. }))
                         {
-                            // This should be unreachable, but if someone manages to copy a pointer
-                            // out of a `static`, then that pointer might point to mutable memory,
-                            // and we would catch that here.
-                            throw_validation_failure!(self.path, PtrToMut { ptr_kind });
+                            throw_validation_failure!(self.path, ConstRefToMutable);
+                        }
+                        if ptr_expected_mutbl == Mutability::Mut
+                            && alloc.inner().mutability == Mutability::Not
+                        {
+                            throw_validation_failure!(self.path, MutableRefToImmutable);
                         }
                     }
-                    // Nothing to check for these.
-                    None | Some(GlobalAlloc::Function(..) | GlobalAlloc::VTable(..)) => {}
+                    GlobalAlloc::Function(..) | GlobalAlloc::VTable(..) => {
+                        // These are immutable, we better don't allow mutable pointers here.
+                        if ptr_expected_mutbl == Mutability::Mut {
+                            throw_validation_failure!(self.path, MutableRefToImmutable);
+                        }
+                    }
                 }
             }
             let path = &self.path;
@@ -532,11 +597,9 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 Ok(true)
             }
             ty::Ref(_, ty, mutbl) => {
-                if matches!(self.ctfe_mode, Some(CtfeValidationMode::Const { .. }))
+                if self.ctfe_mode.is_some_and(|c| !c.may_contain_mutable_ref())
                     && *mutbl == Mutability::Mut
                 {
-                    // A mutable reference inside a const? That does not seem right (except if it is
-                    // a ZST).
                     let layout = self.ecx.layout_of(*ty)?;
                     if !layout.is_zst() {
                         throw_validation_failure!(self.path, MutableRefInConst);
@@ -580,6 +643,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
             | ty::Str
             | ty::Dynamic(..)
             | ty::Closure(..)
+            | ty::CoroutineClosure(..)
             | ty::Coroutine(..) => Ok(false),
             // Some types only occur during typechecking, they have no layout.
             // We should not see them here and we could not check them anyway.
@@ -641,6 +705,19 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValidityVisitor<'rt, 'mir, '
                 OutOfRange { value: format!("{bits}"), range: valid_range, max_value }
             )
         }
+    }
+
+    fn in_mutable_memory(&self, op: &OpTy<'tcx, M::Provenance>) -> bool {
+        if let Some(mplace) = op.as_mplace_or_imm().left() {
+            if let Some(alloc_id) = mplace.ptr().provenance.and_then(|p| p.get_alloc_id()) {
+                if self.ecx.tcx.global_alloc(alloc_id).unwrap_memory().inner().mutability
+                    == Mutability::Mut
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -705,10 +782,12 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
         op: &OpTy<'tcx, M::Provenance>,
         _fields: NonZeroUsize,
     ) -> InterpResult<'tcx> {
-        // Special check preventing `UnsafeCell` inside unions in the inner part of constants.
-        if matches!(self.ctfe_mode, Some(CtfeValidationMode::Const { inner: true, .. })) {
-            if !op.layout.ty.is_freeze(*self.ecx.tcx, self.ecx.param_env) {
-                throw_validation_failure!(self.path, UnsafeCell);
+        // Special check for CTFE validation, preventing `UnsafeCell` inside unions in immutable memory.
+        if self.ctfe_mode.is_some_and(|c| !c.allow_immutable_unsafe_cell()) {
+            if !op.layout.is_zst() && !op.layout.ty.is_freeze(*self.ecx.tcx, self.ecx.param_env) {
+                if !self.in_mutable_memory(op) {
+                    throw_validation_failure!(self.path, UnsafeCellInImmutable);
+                }
             }
         }
         Ok(())
@@ -730,11 +809,14 @@ impl<'rt, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> ValueVisitor<'mir, 'tcx, M>
         }
 
         // Special check preventing `UnsafeCell` in the inner part of constants
-        if let Some(def) = op.layout.ty.ty_adt_def() {
-            if matches!(self.ctfe_mode, Some(CtfeValidationMode::Const { inner: true, .. }))
+        if self.ctfe_mode.is_some_and(|c| !c.allow_immutable_unsafe_cell()) {
+            if !op.layout.is_zst()
+                && let Some(def) = op.layout.ty.ty_adt_def()
                 && def.is_unsafe_cell()
             {
-                throw_validation_failure!(self.path, UnsafeCell);
+                if !self.in_mutable_memory(op) {
+                    throw_validation_failure!(self.path, UnsafeCellInImmutable);
+                }
             }
         }
 
@@ -911,8 +993,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // report them in a way that shows *where* in the value the issue lies.
             Err(err) => {
                 bug!(
-                    "Unexpected Undefined Behavior error during validation: {}",
-                    self.format_error(err)
+                    "Unexpected error during validation: {}",
+                    format_interp_error(self.tcx.dcx(), err)
                 );
             }
         }

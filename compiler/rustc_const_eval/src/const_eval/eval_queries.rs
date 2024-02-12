@@ -1,5 +1,3 @@
-use std::mem;
-
 use either::{Left, Right};
 
 use rustc_hir::def::DefKind;
@@ -13,7 +11,7 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Span;
 use rustc_target::abi::{self, Abi};
 
-use super::{CanAccessStatics, CompileTimeEvalContext, CompileTimeInterpreter};
+use super::{CanAccessMutGlobal, CompileTimeEvalContext, CompileTimeInterpreter};
 use crate::const_eval::CheckAlignment;
 use crate::errors;
 use crate::errors::ConstEvalError;
@@ -24,12 +22,13 @@ use crate::interpret::{
 };
 
 // Returns a pointer to where the result lives
+#[instrument(level = "trace", skip(ecx, body), ret)]
 fn eval_body_using_ecx<'mir, 'tcx>(
     ecx: &mut CompileTimeEvalContext<'mir, 'tcx>,
     cid: GlobalId<'tcx>,
     body: &'mir mir::Body<'tcx>,
 ) -> InterpResult<'tcx, MPlaceTy<'tcx>> {
-    debug!("eval_body_using_ecx: {:?}, {:?}", cid, ecx.param_env);
+    trace!(?ecx.param_env);
     let tcx = *ecx.tcx;
     assert!(
         cid.promoted.is_some()
@@ -75,11 +74,8 @@ fn eval_body_using_ecx<'mir, 'tcx>(
             None => InternKind::Constant,
         }
     };
-    let check_alignment = mem::replace(&mut ecx.machine.check_alignment, CheckAlignment::No); // interning doesn't need to respect alignment
     intern_const_alloc_recursive(ecx, intern_kind, &ret)?;
-    ecx.machine.check_alignment = check_alignment;
 
-    debug!("eval_body_using_ecx done: {:?}", ret);
     Ok(ret)
 }
 
@@ -94,14 +90,14 @@ pub(crate) fn mk_eval_cx<'mir, 'tcx>(
     tcx: TyCtxt<'tcx>,
     root_span: Span,
     param_env: ty::ParamEnv<'tcx>,
-    can_access_statics: CanAccessStatics,
+    can_access_mut_global: CanAccessMutGlobal,
 ) -> CompileTimeEvalContext<'mir, 'tcx> {
     debug!("mk_eval_cx: {:?}", param_env);
     InterpCx::new(
         tcx,
         root_span,
         param_env,
-        CompileTimeInterpreter::new(can_access_statics, CheckAlignment::No),
+        CompileTimeInterpreter::new(can_access_mut_global, CheckAlignment::No),
     )
 }
 
@@ -204,7 +200,7 @@ pub(crate) fn turn_into_const_value<'tcx>(
         tcx,
         tcx.def_span(key.value.instance.def_id()),
         key.param_env,
-        CanAccessStatics::from(is_static),
+        CanAccessMutGlobal::from(is_static),
     );
 
     let mplace = ecx.raw_const_to_mplace(constant).expect(
@@ -225,17 +221,10 @@ pub fn eval_to_const_value_raw_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>,
 ) -> ::rustc_middle::mir::interpret::EvalToConstValueResult<'tcx> {
-    // see comment in eval_to_allocation_raw_provider for what we're doing here
-    if key.param_env.reveal() == Reveal::All {
-        let mut key = key;
-        key.param_env = key.param_env.with_user_facing();
-        match tcx.eval_to_const_value_raw(key) {
-            // try again with reveal all as requested
-            Err(ErrorHandled::TooGeneric(_)) => {}
-            // deduplicate calls
-            other => return other,
-        }
-    }
+    // Const eval always happens in Reveal::All mode in order to be able to use the hidden types of
+    // opaque types. This is needed for trivial things like `size_of`, but also for using associated
+    // types that are not specified in the opaque type.
+    assert_eq!(key.param_env.reveal(), Reveal::All);
 
     // We call `const_eval` for zero arg intrinsics, too, in order to cache their value.
     // Catch such calls and evaluate them instead of trying to load a constant's MIR.
@@ -265,24 +254,11 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>,
 ) -> ::rustc_middle::mir::interpret::EvalToAllocationRawResult<'tcx> {
-    // Because the constant is computed twice (once per value of `Reveal`), we are at risk of
-    // reporting the same error twice here. To resolve this, we check whether we can evaluate the
-    // constant in the more restrictive `Reveal::UserFacing`, which most likely already was
-    // computed. For a large percentage of constants that will already have succeeded. Only
-    // associated constants of generic functions will fail due to not enough monomorphization
-    // information being available.
+    // Const eval always happens in Reveal::All mode in order to be able to use the hidden types of
+    // opaque types. This is needed for trivial things like `size_of`, but also for using associated
+    // types that are not specified in the opaque type.
 
-    // In case we fail in the `UserFacing` variant, we just do the real computation.
-    if key.param_env.reveal() == Reveal::All {
-        let mut key = key;
-        key.param_env = key.param_env.with_user_facing();
-        match tcx.eval_to_allocation_raw(key) {
-            // try again with reveal all as requested
-            Err(ErrorHandled::TooGeneric(_)) => {}
-            // deduplicate calls
-            other => return other,
-        }
-    }
+    assert_eq!(key.param_env.reveal(), Reveal::All);
     if cfg!(debug_assertions) {
         // Make sure we format the instance even if we do not print it.
         // This serves as a regression test against an ICE on printing.
@@ -301,9 +277,11 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
         tcx,
         tcx.def_span(def),
         key.param_env,
-        // Statics (and promoteds inside statics) may access other statics, because unlike consts
+        // Statics (and promoteds inside statics) may access mutable global memory, because unlike consts
         // they do not have to behave "as if" they were evaluated at runtime.
-        CompileTimeInterpreter::new(CanAccessStatics::from(is_static), CheckAlignment::Error),
+        // For consts however we want to ensure they behave "as if" they were evaluated at runtime,
+        // so we have to reject reading mutable global memory.
+        CompileTimeInterpreter::new(CanAccessMutGlobal::from(is_static), CheckAlignment::Error),
     );
     eval_in_interpreter(ecx, cid, is_static)
 }
@@ -313,6 +291,9 @@ pub fn eval_in_interpreter<'mir, 'tcx>(
     cid: GlobalId<'tcx>,
     is_static: bool,
 ) -> ::rustc_middle::mir::interpret::EvalToAllocationRawResult<'tcx> {
+    // `is_static` just means "in static", it could still be a promoted!
+    debug_assert_eq!(is_static, ecx.tcx.static_mutability(cid.instance.def_id()).is_some());
+
     let res = ecx.load_mir(cid.instance.def, cid.promoted);
     match res.and_then(|body| eval_body_using_ecx(&mut ecx, cid, body)) {
         Err(error) => {
@@ -350,8 +331,7 @@ pub fn eval_in_interpreter<'mir, 'tcx>(
         Ok(mplace) => {
             // Since evaluation had no errors, validate the resulting constant.
             // This is a separate `try` block to provide more targeted error reporting.
-            let validation =
-                const_validate_mplace(&ecx, &mplace, is_static, cid.promoted.is_some());
+            let validation = const_validate_mplace(&ecx, &mplace, cid);
 
             let alloc_id = mplace.ptr().provenance.unwrap().alloc_id();
 
@@ -370,22 +350,29 @@ pub fn eval_in_interpreter<'mir, 'tcx>(
 pub fn const_validate_mplace<'mir, 'tcx>(
     ecx: &InterpCx<'mir, 'tcx, CompileTimeInterpreter<'mir, 'tcx>>,
     mplace: &MPlaceTy<'tcx>,
-    is_static: bool,
-    is_promoted: bool,
+    cid: GlobalId<'tcx>,
 ) -> InterpResult<'tcx> {
     let mut ref_tracking = RefTracking::new(mplace.clone());
     let mut inner = false;
     while let Some((mplace, path)) = ref_tracking.todo.pop() {
-        let mode = if is_static {
-            if is_promoted {
-                // Promoteds in statics are allowed to point to statics.
-                CtfeValidationMode::Const { inner, allow_static_ptrs: true }
-            } else {
-                // a `static`
-                CtfeValidationMode::Regular
+        let mode = match ecx.tcx.static_mutability(cid.instance.def_id()) {
+            Some(_) if cid.promoted.is_some() => {
+                // Promoteds in statics are consts that re allowed to point to statics.
+                CtfeValidationMode::Const {
+                    allow_immutable_unsafe_cell: false,
+                    allow_extern_static_ptrs: true,
+                }
             }
-        } else {
-            CtfeValidationMode::Const { inner, allow_static_ptrs: false }
+            Some(mutbl) => CtfeValidationMode::Static { mutbl }, // a `static`
+            None => {
+                // In normal `const` (not promoted), the outermost allocation is always only copied,
+                // so having `UnsafeCell` in there is okay despite them being in immutable memory.
+                let allow_immutable_unsafe_cell = cid.promoted.is_none() && !inner;
+                CtfeValidationMode::Const {
+                    allow_immutable_unsafe_cell,
+                    allow_extern_static_ptrs: false,
+                }
+            }
         };
         ecx.const_validate_operand(&mplace.into(), path, &mut ref_tracking, mode)?;
         inner = true;

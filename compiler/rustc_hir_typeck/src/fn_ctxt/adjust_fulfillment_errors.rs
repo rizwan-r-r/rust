@@ -86,14 +86,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // Finally, for ambiguity-related errors, we actually want to look
         // for a parameter that is the source of the inference type left
         // over in this predicate.
-        if let traits::FulfillmentErrorCode::CodeAmbiguity { .. } = error.code {
+        if let traits::FulfillmentErrorCode::Ambiguity { .. } = error.code {
             fallback_param_to_point_at = None;
             self_param_to_point_at = None;
             param_to_point_at =
                 self.find_ambiguous_parameter_in(def_id, error.root_obligation.predicate);
         }
 
-        let hir = self.tcx.hir();
         let (expr, qpath) = match self.tcx.hir_node(hir_id) {
             hir::Node::Expr(expr) => {
                 if self.closure_span_overlaps_error(error, expr.span) {
@@ -122,7 +121,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 hir_id: call_hir_id,
                 span: call_span,
                 ..
-            }) = hir.get_parent(hir_id)
+            }) = self.tcx.parent_hir_node(hir_id)
                 && callee.hir_id == hir_id
             {
                 if self.closure_span_overlaps_error(error, *call_span) {
@@ -361,10 +360,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         error: &traits::FulfillmentError<'tcx>,
         span: Span,
     ) -> bool {
-        if let traits::FulfillmentErrorCode::CodeSelectionError(
-            traits::SelectionError::OutputTypeParameterMismatch(
-                box traits::SelectionOutputTypeParameterMismatch { expected_trait_ref, .. },
-            ),
+        if let traits::FulfillmentErrorCode::SelectionError(
+            traits::SelectionError::SignatureMismatch(box traits::SignatureMismatchData {
+                expected_trait_ref,
+                ..
+            }),
         ) = error.code
             && let ty::Closure(def_id, _) | ty::Coroutine(def_id, ..) =
                 expected_trait_ref.skip_binder().self_ty().kind()

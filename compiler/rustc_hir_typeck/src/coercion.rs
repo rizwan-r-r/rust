@@ -36,7 +36,9 @@
 //! ```
 
 use crate::FnCtxt;
-use rustc_errors::{struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, MultiSpan};
+use rustc_errors::{
+    codes::*, struct_span_code_err, Applicability, Diagnostic, DiagnosticBuilder, MultiSpan,
+};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::{self, Visitor};
@@ -183,17 +185,6 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         let a = self.shallow_resolve(a);
         let b = self.shallow_resolve(b);
         debug!("Coerce.tys({:?} => {:?})", a, b);
-
-        // Just ignore error types.
-        if let Err(guar) = (a, b).error_reported() {
-            // Best-effort try to unify these types -- we're already on the error path,
-            // so this will have the side-effect of making sure we have no ambiguities
-            // due to `[type error]` and `_` not coercing together.
-            let _ = self.commit_if_ok(|_| {
-                self.at(&self.cause, self.param_env).eq(DefineOpaqueTypes::Yes, a, b)
-            });
-            return success(vec![], Ty::new_error(self.fcx.tcx, guar), vec![]);
-        }
 
         // Coercing from `!` to any type is allowed:
         if a.is_never() {
@@ -625,6 +616,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         )];
 
         let mut has_unsized_tuple_coercion = false;
+        let mut has_trait_upcasting_coercion = None;
 
         // Keep resolving `CoerceUnsized` and `Unsize` predicates to avoid
         // emitting a coercion in cases like `Foo<$1>` -> `Foo<$2>`, where
@@ -692,6 +684,13 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                     // these here and emit a feature error if coercion doesn't fail
                     // due to another reason.
                     match impl_source {
+                        traits::ImplSource::Builtin(
+                            BuiltinImplSource::TraitUpcasting { .. },
+                            _,
+                        ) => {
+                            has_trait_upcasting_coercion =
+                                Some((trait_pred.self_ty(), trait_pred.trait_ref.args.type_at(1)));
+                        }
                         traits::ImplSource::Builtin(BuiltinImplSource::TupleUnsizing, _) => {
                             has_unsized_tuple_coercion = true;
                         }
@@ -702,9 +701,24 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
             }
         }
 
+        if let Some((sub, sup)) = has_trait_upcasting_coercion
+            && !self.tcx().features().trait_upcasting
+        {
+            // Renders better when we erase regions, since they're not really the point here.
+            let (sub, sup) = self.tcx.erase_regions((sub, sup));
+            let mut err = feature_err(
+                &self.tcx.sess,
+                sym::trait_upcasting,
+                self.cause.span,
+                format!("cannot cast `{sub}` to `{sup}`, trait upcasting coercion is experimental"),
+            );
+            err.note(format!("required when coercing `{source}` into `{target}`"));
+            err.emit();
+        }
+
         if has_unsized_tuple_coercion && !self.tcx.features().unsized_tuple_coercion {
             feature_err(
-                &self.tcx.sess.parse_sess,
+                &self.tcx.sess,
                 sym::unsized_tuple_coercion,
                 self.cause.span,
                 "unsized tuple coercion is not stable enough for use and is subject to change",
@@ -1571,7 +1585,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                 let mut visitor = CollectRetsVisitor { ret_exprs: vec![] };
                 match *cause.code() {
                     ObligationCauseCode::ReturnNoExpression => {
-                        err = struct_span_err!(
+                        err = struct_span_code_err!(
                             fcx.dcx(),
                             cause.span,
                             E0069,
@@ -1580,7 +1594,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                         err.span_label(cause.span, "return type is not `()`");
                     }
                     ObligationCauseCode::BlockTailExpression(blk_id, ..) => {
-                        let parent_id = fcx.tcx.hir().parent_id(blk_id);
+                        let parent_id = fcx.tcx.parent_hir_id(blk_id);
                         err = self.report_return_mismatched_types(
                             cause,
                             expected,
@@ -1690,8 +1704,8 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         let ret_msg = "return a value for the case when the loop has zero elements to iterate on";
         let ret_ty_msg =
             "otherwise consider changing the return type to account for that possibility";
-        if let Some(node) = tcx.opt_hir_node(item.into())
-            && let Some(body_id) = node.body_id()
+        let node = tcx.hir_node(item.into());
+        if let Some(body_id) = node.body_id()
             && let Some(sig) = node.fn_sig()
             && let hir::ExprKind::Block(block, _) = hir.body(body_id).value.kind
             && !ty.is_never()
@@ -1771,7 +1785,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
     ) -> DiagnosticBuilder<'a> {
         let mut err = fcx.err_ctxt().report_mismatched_types(cause, expected, found, ty_err);
 
-        let parent_id = fcx.tcx.hir().parent_id(id);
+        let parent_id = fcx.tcx.parent_hir_id(id);
         let parent = fcx.tcx.hir_node(parent_id);
         if let Some(expr) = expression
             && let hir::Node::Expr(hir::Expr {

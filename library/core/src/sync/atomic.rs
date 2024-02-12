@@ -138,7 +138,7 @@
 //!
 //! In general, *all* atomic accesses on read-only memory are Undefined Behavior. For instance, attempting
 //! to do a `compare_exchange` that will definitely fail (making it conceptually a read-only
-//! operation) can still cause a page fault if the underlying memory page is mapped read-only. Since
+//! operation) can still cause a segmentation fault if the underlying memory page is mapped read-only. Since
 //! atomic `load`s might be implemented using compare-exchange operations, even a `load` can fault
 //! on read-only memory.
 //!
@@ -181,12 +181,13 @@
 //!     let spinlock = Arc::new(AtomicUsize::new(1));
 //!
 //!     let spinlock_clone = Arc::clone(&spinlock);
+//!
 //!     let thread = thread::spawn(move|| {
-//!         spinlock_clone.store(0, Ordering::SeqCst);
+//!         spinlock_clone.store(0, Ordering::Release);
 //!     });
 //!
 //!     // Wait for the other thread to release the lock
-//!     while spinlock.load(Ordering::SeqCst) != 0 {
+//!     while spinlock.load(Ordering::Acquire) != 0 {
 //!         hint::spin_loop();
 //!     }
 //!
@@ -203,7 +204,11 @@
 //!
 //! static GLOBAL_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 //!
-//! let old_thread_count = GLOBAL_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
+//! // Note that Relaxed ordering doesn't synchronize anything
+//! // except the global thread counter itself.
+//! let old_thread_count = GLOBAL_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
+//! // Note that this number may not be true at the moment of printing
+//! // because some other thread may have changed static value already.
 //! println!("live threads: {}", old_thread_count + 1);
 //! ```
 
@@ -211,6 +216,10 @@
 #![cfg_attr(not(target_has_atomic_load_store = "8"), allow(dead_code))]
 #![cfg_attr(not(target_has_atomic_load_store = "8"), allow(unused_imports))]
 #![rustc_diagnostic_item = "atomic_mod"]
+// Clippy complains about the pattern of "safe function calling unsafe function taking pointers".
+// This happens with AtomicPtr intrinsics but is fine, as the pointers clippy is concerned about
+// are just normal values that get loaded/stored, but not dereferenced.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use self::Ordering::*;
 
@@ -2114,7 +2123,16 @@ macro_rules! atomic_int {
         /// This type has the same in-memory representation as the underlying
         /// integer type, [`
         #[doc = $s_int_type]
-        /// `]. For more about the differences between atomic types and
+        /// `].
+        #[doc = if_not_8_bit! {
+            $int_type,
+            concat!(
+                "However, the alignment of this type is always equal to its ",
+                "size, even on targets where [`", $s_int_type, "`] has a ",
+                "lesser alignment."
+            )
+        }]
+        /// For more about the differences between atomic types and
         /// non-atomic types as well as information about the portability of
         /// this type, please see the [module-level documentation].
         ///
